@@ -1,6 +1,0 @@
-LIBRARY HelloPlugin
-EXPORTS
-    GetPluginName
-    GetPluginDescription
-    GetPluginVersion
-    GetPluginMenuItems

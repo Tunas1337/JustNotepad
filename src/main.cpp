@@ -143,6 +143,49 @@ std::vector<CHARRANGE> vecSelectionStack;
 std::vector<SelectionLevel> vecSelectionLevelStack;
 
 Document g_Document;
+
+// Virtual file for large file support (instant display + smooth scrolling)
+#define VIRTUAL_THRESHOLD_TEXT   (5 * 1024 * 1024)   // 5MB
+#define VIRTUAL_THRESHOLD_BINARY (1 * 1024 * 1024)   // 1MB (expands ~5x as hex)
+#define VIRTUAL_WINDOW_LINES     5000                 // Lines kept in RichEdit at once
+
+struct VirtualFile {
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    HANDLE hMap = NULL;
+    const BYTE* pData = nullptr;
+    DWORD fileSize = 0;
+    Encoding encoding = ENC_UTF8;
+    BOOL isBinary = FALSE;
+    int bomSize = 0;
+
+    // Line offsets: byte offset of each line start relative to (pData + bomSize) for text,
+    // or absolute byte offset for binary hex (each line = 16 bytes)
+    std::vector<size_t> lineOffsets;
+    size_t totalLines = 0;
+
+    // Virtual window state
+    size_t viewTopLine = 0;
+    int visibleLines = 50; // computed from editor height
+
+    bool active = false;
+
+    void Close() {
+        if (pData) { UnmapViewOfFile(pData); pData = nullptr; }
+        if (hMap) { CloseHandle(hMap); hMap = NULL; }
+        if (hFile != INVALID_HANDLE_VALUE) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; }
+        lineOffsets.clear();
+        lineOffsets.shrink_to_fit();
+        totalLines = 0;
+        viewTopLine = 0;
+        active = false;
+        isBinary = FALSE;
+        fileSize = 0;
+        bomSize = 0;
+    }
+};
+
+VirtualFile g_VirtualFile;
+
 PluginManager g_PluginManager;
 
 // Config
@@ -266,6 +309,262 @@ void ParallelConvert(const BYTE* pData, size_t size, Encoding encoding, std::vec
     outBuffer.push_back(0);
 }
 
+// Format raw bytes as hex dump: "OFFSET  | HH HH HH ... | ASCII"
+// 16 bytes per line. Output is wide string suitable for RichEdit.
+void FormatHexDump(const BYTE* pData, size_t size, std::vector<wchar_t>& outBuffer, HWND hProgress = NULL, size_t startAddr = 0)
+{
+    static const wchar_t hexChars[] = L"0123456789ABCDEF";
+    
+    // Each line: 8 offset + 3 sep + 48 hex + 2 sep + 16 ascii + 2 crlf = 79 chars
+    // Pre-allocate for performance
+    size_t numLines = (size + 15) / 16;
+    outBuffer.reserve(numLines * 80 + 1);
+    
+    wchar_t line[80];
+    
+    for (size_t offset = 0; offset < size; offset += 16)
+    {
+        size_t lineBytes = min((size_t)16, size - offset);
+        
+        // Offset (8 hex digits) - use startAddr + offset for correct addresses
+        size_t addr = offset + startAddr;
+        for (int i = 7; i >= 0; i--)
+        {
+            line[i] = hexChars[(addr >> ((7 - i) * 4)) & 0xF];
+        }
+        line[8] = L' ';
+        line[9] = L' ';
+        
+        // Hex bytes
+        size_t pos = 10;
+        for (size_t i = 0; i < 16; i++)
+        {
+            if (i == 8) { line[pos++] = L' '; } // extra space at midpoint
+            if (i < lineBytes)
+            {
+                BYTE b = pData[offset + i];
+                line[pos++] = hexChars[b >> 4];
+                line[pos++] = hexChars[b & 0xF];
+            }
+            else
+            {
+                line[pos++] = L' ';
+                line[pos++] = L' ';
+            }
+            line[pos++] = L' ';
+        }
+        
+        line[pos++] = L' ';
+        
+        // ASCII
+        for (size_t i = 0; i < 16; i++)
+        {
+            if (i < lineBytes)
+            {
+                BYTE b = pData[offset + i];
+                line[pos++] = (b >= 0x20 && b <= 0x7E) ? (wchar_t)b : L'.';
+            }
+            else
+            {
+                line[pos++] = L' ';
+            }
+        }
+        
+        line[pos++] = L'\r';
+        line[pos++] = L'\n';
+        
+        outBuffer.insert(outBuffer.end(), line, line + pos);
+        
+        // Report progress every 64KB of input
+        if (hProgress && ((offset & 0xFFFF) == 0))
+        {
+            PostMessage(hProgress, WM_LOAD_PROGRESS, (WPARAM)offset, 0);
+        }
+    }
+    
+    outBuffer.push_back(0);
+}
+
+// ============================================================================
+// Virtual File Functions - for large file support
+// ============================================================================
+
+void VirtualFileScanLines(VirtualFile& vf)
+{
+    if (vf.isBinary) {
+        // Hex view: each line = 16 bytes, offsets are trivially computed
+        vf.totalLines = (vf.fileSize + 15) / 16;
+        // No lineOffsets needed for binary - computed on the fly
+        return;
+    }
+
+    const BYTE* data = vf.pData + vf.bomSize;
+    size_t dataSize = (size_t)vf.fileSize - vf.bomSize;
+
+    vf.lineOffsets.clear();
+    vf.lineOffsets.reserve(dataSize / 40 + 1); // estimate ~40 bytes/line
+    vf.lineOffsets.push_back(0); // first line at offset 0
+
+    if (vf.encoding == ENC_UTF16LE) {
+        for (size_t i = 0; i + 1 < dataSize; i += 2) {
+            if (data[i] == 0x0A && data[i + 1] == 0x00) {
+                vf.lineOffsets.push_back(i + 2);
+            }
+        }
+    } else if (vf.encoding == ENC_UTF16BE) {
+        for (size_t i = 0; i + 1 < dataSize; i += 2) {
+            if (data[i] == 0x00 && data[i + 1] == 0x0A) {
+                vf.lineOffsets.push_back(i + 2);
+            }
+        }
+    } else {
+        // UTF-8 / ANSI / single-byte encodings: scan for 0x0A
+        for (size_t i = 0; i < dataSize; i++) {
+            if (data[i] == 0x0A) {
+                vf.lineOffsets.push_back(i + 1);
+            }
+        }
+    }
+
+    vf.totalLines = vf.lineOffsets.size();
+}
+
+// Get text for a range of lines from the virtual file
+std::wstring VirtualFileGetLines(VirtualFile& vf, size_t startLine, size_t count)
+{
+    if (!vf.active || !vf.pData || vf.totalLines == 0) return L"";
+    if (startLine >= vf.totalLines) return L"";
+
+    size_t endLine = min(startLine + count, vf.totalLines);
+
+    if (vf.isBinary) {
+        // Generate hex dump for the requested line range
+        size_t startByte = startLine * 16;
+        size_t endByte = min((size_t)vf.fileSize, endLine * 16);
+        if (startByte >= (size_t)vf.fileSize) return L"";
+
+        std::vector<wchar_t> hexBuf;
+        FormatHexDump(vf.pData + startByte, endByte - startByte, hexBuf, NULL, startByte);
+        return std::wstring(hexBuf.data(), hexBuf.size() > 0 ? hexBuf.size() - 1 : 0);
+    }
+
+    // Text file: extract bytes for the requested lines and convert
+    const BYTE* data = vf.pData + vf.bomSize;
+    size_t dataSize = (size_t)vf.fileSize - vf.bomSize;
+
+    size_t byteStart = vf.lineOffsets[startLine];
+    size_t byteEnd = (endLine < vf.totalLines) ? vf.lineOffsets[endLine] : dataSize;
+
+    if (byteStart >= byteEnd) return L"";
+    size_t len = byteEnd - byteStart;
+
+    if (vf.encoding == ENC_UTF16LE) {
+        return std::wstring((const wchar_t*)(data + byteStart), len / 2);
+    } else if (vf.encoding == ENC_UTF16BE) {
+        std::wstring result(len / 2, 0);
+        const WORD* src = (const WORD*)(data + byteStart);
+        for (size_t i = 0; i < len / 2; i++) {
+            result[i] = _byteswap_ushort(src[i]);
+        }
+        return result;
+    } else {
+        const EncodingInfo* info = GetEncodingInfo(vf.encoding);
+        int needed = MultiByteToWideChar(info->codePage, 0, (LPCSTR)(data + byteStart), (int)len, NULL, 0);
+        if (needed <= 0) return L"";
+        std::wstring result(needed, 0);
+        MultiByteToWideChar(info->codePage, 0, (LPCSTR)(data + byteStart), (int)len, &result[0], needed);
+        return result;
+    }
+}
+
+void VirtualFileComputeVisibleLines(VirtualFile& vf, HWND hEditor)
+{
+    if (!hEditor) return;
+    RECT rc;
+    GetClientRect(hEditor, &rc);
+    if (rc.bottom <= rc.top) return;
+
+    // Get line height from RichEdit
+    int lineHeight = 18; // fallback
+    POINT pt0 = {};
+    SendMessage(hEditor, EM_POSFROMCHAR, (WPARAM)&pt0, 0);
+    int idx1 = (int)SendMessage(hEditor, EM_LINEINDEX, 1, 0);
+    if (idx1 > 0) {
+        POINT pt1 = {};
+        SendMessage(hEditor, EM_POSFROMCHAR, (WPARAM)&pt1, idx1);
+        if (pt1.y > pt0.y) lineHeight = pt1.y - pt0.y;
+    }
+    vf.visibleLines = max(1, (rc.bottom - rc.top) / lineHeight);
+}
+
+void VirtualFileUpdateScrollbar(VirtualFile& vf, HWND hEditor)
+{
+    if (!vf.active || !hEditor) return;
+
+    SCROLLINFO si = {};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL;
+    si.nMin = 0;
+    si.nMax = (int)(vf.totalLines > 0 ? vf.totalLines - 1 : 0);
+    si.nPage = vf.visibleLines;
+    si.nPos = (int)vf.viewTopLine;
+    SetScrollInfo(hEditor, SB_VERT, &si, TRUE);
+}
+
+void VirtualFileRenderWindow(VirtualFile& vf, HWND hEditor)
+{
+    if (!vf.active || !hEditor) return;
+
+    // Clamp viewTopLine
+    if (vf.totalLines == 0) {
+        vf.viewTopLine = 0;
+    } else if (vf.viewTopLine + vf.visibleLines > vf.totalLines) {
+        // Allow scrolling to the end but not past it
+        if (vf.totalLines > (size_t)vf.visibleLines)
+            vf.viewTopLine = min(vf.viewTopLine, vf.totalLines - vf.visibleLines);
+        else
+            vf.viewTopLine = 0;
+    }
+
+    size_t windowLines = VIRTUAL_WINDOW_LINES;
+    std::wstring text = VirtualFileGetLines(vf, vf.viewTopLine, windowLines);
+
+    SendMessage(hEditor, WM_SETREDRAW, FALSE, 0);
+    SendMessage(hEditor, WM_SETTEXT, 0, (LPARAM)text.c_str());
+    SendMessage(hEditor, EM_SETSEL, 0, 0); // cursor at top
+    SendMessage(hEditor, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(hEditor, NULL, TRUE);
+
+    VirtualFileUpdateScrollbar(vf, hEditor);
+}
+
+BOOL VirtualFileOpen(VirtualFile& vf, LPCTSTR pszFile, Encoding encoding, BOOL isBinary, int bomSize, DWORD fileSize)
+{
+    vf.Close();
+
+    vf.hFile = CreateFile(pszFile, GENERIC_READ, FILE_SHARE_READ, NULL,
+                          OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (vf.hFile == INVALID_HANDLE_VALUE) return FALSE;
+
+    vf.hMap = CreateFileMapping(vf.hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!vf.hMap) { vf.Close(); return FALSE; }
+
+    vf.pData = (const BYTE*)MapViewOfFile(vf.hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!vf.pData) { vf.Close(); return FALSE; }
+
+    vf.fileSize = fileSize;
+    vf.encoding = encoding;
+    vf.isBinary = isBinary;
+    vf.bomSize = bomSize;
+    vf.viewTopLine = 0;
+    vf.active = true;
+
+    // Scan line offsets - fast even for large files (linear scan of mmap'd data)
+    VirtualFileScanLines(vf);
+
+    return TRUE;
+}
+
 void LoadWorker(std::wstring filename, Encoding encoding, HWND hMain, long sequence, BOOL isBinary)
 {
     HANDLE hFile = CreateFile(filename.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -295,9 +594,7 @@ void LoadWorker(std::wstring filename, Encoding encoding, HWND hMain, long seque
     res->sequence = sequence;
     
     if (isBinary) {
-        std::wstring msg = L"This file is binary and cannot be displayed in the text editor.\r\nUse the Hex Editor plugin to view the content.";
-        res->buffer.assign(msg.begin(), msg.end());
-        res->buffer.push_back(0);
+        FormatHexDump(pData, size, res->buffer, hMain);
     }
     else if (encoding == ENC_UTF16LE) {
         size_t chars = (size - offset) / 2;
@@ -572,7 +869,7 @@ BOOL LoadFromFile(LPCTSTR pszFile)
         
         if (isBinary)
         {
-            // Ensure word wrap is disabled for any future text
+            // Ensure word wrap is disabled for hex view
             if (bWordWrap)
             {
                 bWordWrap = FALSE;
@@ -581,37 +878,109 @@ BOOL LoadFromFile(LPCTSTR pszFile)
                 CheckMenuItem(hMenu, ID_VIEW_WORDWRAP, MF_UNCHECKED);
             }
 
-            // Disable editor and clear text
-            SendMessage(doc.hEditor, WM_SETTEXT, 0, (LPARAM)L"");
-            EnableWindow(doc.hEditor, FALSE);
+            // Enable editor (read-only) so user can scroll, copy, search
+            EnableWindow(doc.hEditor, TRUE);
+            doc.isBinary = TRUE;
 
-            // Clean up any mapping/handles before showing modal
+            // Close the detection handles - VirtualFileOpen will re-open
             if (pData) UnmapViewOfFile(pData);
             if (hMap) CloseHandle(hMap);
             CloseHandle(hFile);
+            pData = NULL; hMap = NULL; hFile = INVALID_HANDLE_VALUE;
 
-            // Update document state
+            if (fileSize <= VIRTUAL_THRESHOLD_BINARY)
+            {
+                // Small binary: generate hex dump synchronously into RichEdit
+                g_VirtualFile.Close();
+
+                HANDLE hf = CreateFile(pszFile, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hf == INVALID_HANDLE_VALUE) return FALSE;
+                HANDLE hm = CreateFileMapping(hf, NULL, PAGE_READONLY, 0, 0, NULL);
+                if (!hm) { CloseHandle(hf); return FALSE; }
+                const BYTE* pd = (const BYTE*)MapViewOfFile(hm, FILE_MAP_READ, 0, 0, 0);
+                if (!pd) { CloseHandle(hm); CloseHandle(hf); return FALSE; }
+
+                std::vector<wchar_t> hexBuf;
+                FormatHexDump(pd, fileSize, hexBuf);
+                UnmapViewOfFile(pd);
+                CloseHandle(hm);
+                CloseHandle(hf);
+
+                SendMessage(doc.hEditor, WM_SETREDRAW, FALSE, 0);
+                SendMessage(doc.hEditor, WM_SETTEXT, 0, (LPARAM)hexBuf.data());
+                SendMessage(doc.hEditor, WM_SETREDRAW, TRUE, 0);
+                InvalidateRect(doc.hEditor, NULL, TRUE);
+                SendMessage(doc.hEditor, EM_SETREADONLY, TRUE, 0);
+            }
+            else
+            {
+                // Large binary: virtual hex mode — instant display, smooth scroll
+                if (!VirtualFileOpen(g_VirtualFile, pszFile, doc.currentEncoding, TRUE, 0, fileSize))
+                    return FALSE;
+
+                VirtualFileComputeVisibleLines(g_VirtualFile, doc.hEditor);
+                VirtualFileRenderWindow(g_VirtualFile, doc.hEditor);
+                SendMessage(doc.hEditor, EM_SETREADONLY, TRUE, 0);
+            }
+
             StringCchCopy(doc.szFileName, MAX_PATH, pszFile);
             GetFileLastWriteTime(doc.szFileName, &doc.ftLastWriteTime);
             doc.bIsDirty = FALSE;
             doc.bLoading = FALSE;
-            doc.isBinary = TRUE;
-
-            // Hide progress bar if visible
             ShowWindow(hProgressBarStatus, SW_HIDE);
-
             UpdateTitle();
             UpdateStatusBar();
-
-            // Notify plugins
             g_PluginManager.NotifyFileEvent(doc.szFileName, doc.hEditor, L"Loaded");
-
             return TRUE;
         }
         
         // Re-enable editor if it was disabled (e.g. previous file was binary)
         EnableWindow(doc.hEditor, TRUE);
         doc.isBinary = FALSE;
+
+        // ---- Virtual mode for large text files ----
+        if (fileSize > VIRTUAL_THRESHOLD_TEXT)
+        {
+            // Close detection handles - VirtualFileOpen re-opens the file
+            if (pData) UnmapViewOfFile(pData);
+            if (hMap) CloseHandle(hMap);
+            CloseHandle(hFile);
+            pData = NULL; hMap = NULL; hFile = INVALID_HANDLE_VALUE;
+
+            if (!VirtualFileOpen(g_VirtualFile, pszFile, doc.currentEncoding, FALSE, bomSize, fileSize))
+                return FALSE;
+
+            // Disable word wrap for virtual mode
+            if (bWordWrap)
+            {
+                bWordWrap = FALSE;
+                SendMessage(doc.hEditor, EM_SETTARGETDEVICE, 0, 1);
+                HMENU hMenu2 = GetMenu(hMain);
+                CheckMenuItem(hMenu2, ID_VIEW_WORDWRAP, MF_UNCHECKED);
+            }
+
+            VirtualFileComputeVisibleLines(g_VirtualFile, doc.hEditor);
+            VirtualFileRenderWindow(g_VirtualFile, doc.hEditor);
+            SendMessage(doc.hEditor, EM_SETREADONLY, TRUE, 0);
+
+            StringCchCopy(doc.szFileName, MAX_PATH, pszFile);
+            GetFileLastWriteTime(doc.szFileName, &doc.ftLastWriteTime);
+            doc.bIsDirty = FALSE;
+            doc.bLoading = FALSE;
+            ShowWindow(hProgressBarStatus, SW_HIDE);
+
+            DWORD dwAttrs = GetFileAttributes(doc.szFileName);
+            HMENU hMenu = GetMenu(hMain);
+            CheckMenuItem(hMenu, ID_FILE_TOGGLEREADONLY, MF_CHECKED);
+
+            UpdateTitle();
+            UpdateStatusBar();
+            g_PluginManager.NotifyFileEvent(doc.szFileName, doc.hEditor, L"Loaded");
+            return TRUE;
+        }
+
+        // ---- Normal mode for small/medium text files ----
+        g_VirtualFile.Close(); // close any previous virtual file
 
         // Unified Loading Strategy (text files only)
         // Always use background loading path for files > 4KB (approx 1 screen)
@@ -749,6 +1118,7 @@ void DoReload()
             return;
         }
     }
+    g_VirtualFile.Close();
     LoadFromFile(doc.szFileName);
 }
 
@@ -1375,11 +1745,24 @@ INT_PTR CALLBACK GoToDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
             int nLine = GetDlgItemInt(hDlg, IDC_GOTO_LINE, &bTranslated, FALSE);
             if (bTranslated && nLine > 0)
             {
-                int nIndex = SendMessage(hEditor, EM_LINEINDEX, nLine - 1, 0);
-                if (nIndex != -1)
+                if (g_VirtualFile.active)
                 {
-                    SendMessage(hEditor, EM_SETSEL, nIndex, nIndex);
-                    SendMessage(hEditor, EM_SCROLLCARET, 0, 0);
+                    // Virtual mode: scroll to the target line
+                    size_t targetLine = (size_t)(nLine - 1);
+                    if (targetLine >= g_VirtualFile.totalLines)
+                        targetLine = g_VirtualFile.totalLines > 0 ? g_VirtualFile.totalLines - 1 : 0;
+                    g_VirtualFile.viewTopLine = targetLine;
+                    VirtualFileRenderWindow(g_VirtualFile, hEditor);
+                    UpdateStatusBar();
+                }
+                else
+                {
+                    int nIndex = SendMessage(hEditor, EM_LINEINDEX, nLine - 1, 0);
+                    if (nIndex != -1)
+                    {
+                        SendMessage(hEditor, EM_SETSEL, nIndex, nIndex);
+                        SendMessage(hEditor, EM_SCROLLCARET, 0, 0);
+                    }
                 }
             }
             EndDialog(hDlg, LOWORD(wParam));
@@ -1402,6 +1785,9 @@ void DoGoTo()
 
 void ToggleWordWrap()
 {
+    // Word wrap not supported in virtual mode (breaks line-based virtualization)
+    if (g_VirtualFile.active) return;
+    
     bWordWrap = !bWordWrap;
     if (bWordWrap)
     {
@@ -1572,17 +1958,123 @@ LRESULT CALLBACK EditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     }
     else if (msg == WM_MOUSEWHEEL)
     {
-        // Force snappy scrolling (3 lines per notch, no smooth animation)
         short zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
         int lines = 3;
         SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
-        if (lines == WHEEL_PAGESCROLL) lines = 3; // Fallback
-        
+        if (lines == WHEEL_PAGESCROLL) lines = 3;
+
         int scrollLines = (zDelta / WHEEL_DELTA) * lines;
-        
-        // Use EM_LINESCROLL for snappy scrolling
+
+        if (g_VirtualFile.active)
+        {
+            // Virtual mode: scroll the virtual window
+            if (scrollLines > 0 && g_VirtualFile.viewTopLine < (size_t)scrollLines)
+                g_VirtualFile.viewTopLine = 0;
+            else
+                g_VirtualFile.viewTopLine -= scrollLines;
+
+            if (g_VirtualFile.totalLines > (size_t)g_VirtualFile.visibleLines &&
+                g_VirtualFile.viewTopLine > g_VirtualFile.totalLines - g_VirtualFile.visibleLines)
+                g_VirtualFile.viewTopLine = g_VirtualFile.totalLines - g_VirtualFile.visibleLines;
+
+            VirtualFileRenderWindow(g_VirtualFile, hwnd);
+            return 0;
+        }
+
+        // Normal mode: snappy line scrolling
         SendMessage(hwnd, EM_LINESCROLL, 0, -scrollLines);
-        return 0; // Handled
+        return 0;
+    }
+    else if (msg == WM_VSCROLL && g_VirtualFile.active)
+    {
+        SCROLLINFO si = {};
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_ALL;
+        GetScrollInfo(hwnd, SB_VERT, &si);
+
+        size_t maxTop = 0;
+        if (g_VirtualFile.totalLines > (size_t)g_VirtualFile.visibleLines)
+            maxTop = g_VirtualFile.totalLines - g_VirtualFile.visibleLines;
+
+        switch (LOWORD(wParam))
+        {
+        case SB_LINEUP:
+            if (g_VirtualFile.viewTopLine > 0) g_VirtualFile.viewTopLine--;
+            break;
+        case SB_LINEDOWN:
+            if (g_VirtualFile.viewTopLine < maxTop) g_VirtualFile.viewTopLine++;
+            break;
+        case SB_PAGEUP:
+            if (g_VirtualFile.viewTopLine > (size_t)si.nPage)
+                g_VirtualFile.viewTopLine -= si.nPage;
+            else
+                g_VirtualFile.viewTopLine = 0;
+            break;
+        case SB_PAGEDOWN:
+            g_VirtualFile.viewTopLine = min(g_VirtualFile.viewTopLine + si.nPage, maxTop);
+            break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION:
+            g_VirtualFile.viewTopLine = (size_t)si.nTrackPos;
+            break;
+        case SB_TOP:
+            g_VirtualFile.viewTopLine = 0;
+            break;
+        case SB_BOTTOM:
+            g_VirtualFile.viewTopLine = maxTop;
+            break;
+        }
+
+        if (g_VirtualFile.viewTopLine > maxTop) g_VirtualFile.viewTopLine = maxTop;
+        VirtualFileRenderWindow(g_VirtualFile, hwnd);
+        return 0;
+    }
+    else if (msg == WM_KEYDOWN && g_VirtualFile.active)
+    {
+        size_t maxTop = 0;
+        if (g_VirtualFile.totalLines > (size_t)g_VirtualFile.visibleLines)
+            maxTop = g_VirtualFile.totalLines - g_VirtualFile.visibleLines;
+
+        BOOL handled = FALSE;
+        if (wParam == VK_PRIOR) // Page Up
+        {
+            if (g_VirtualFile.viewTopLine > (size_t)g_VirtualFile.visibleLines)
+                g_VirtualFile.viewTopLine -= g_VirtualFile.visibleLines;
+            else
+                g_VirtualFile.viewTopLine = 0;
+            handled = TRUE;
+        }
+        else if (wParam == VK_NEXT) // Page Down
+        {
+            g_VirtualFile.viewTopLine = min(g_VirtualFile.viewTopLine + g_VirtualFile.visibleLines, maxTop);
+            handled = TRUE;
+        }
+        else if (wParam == VK_HOME && (GetKeyState(VK_CONTROL) & 0x8000))
+        {
+            g_VirtualFile.viewTopLine = 0;
+            handled = TRUE;
+        }
+        else if (wParam == VK_END && (GetKeyState(VK_CONTROL) & 0x8000))
+        {
+            g_VirtualFile.viewTopLine = maxTop;
+            handled = TRUE;
+        }
+        else if (wParam == VK_UP)
+        {
+            if (g_VirtualFile.viewTopLine > 0) g_VirtualFile.viewTopLine--;
+            handled = TRUE;
+        }
+        else if (wParam == VK_DOWN)
+        {
+            if (g_VirtualFile.viewTopLine < maxTop) g_VirtualFile.viewTopLine++;
+            handled = TRUE;
+        }
+
+        if (handled)
+        {
+            VirtualFileRenderWindow(g_VirtualFile, hwnd);
+            return 0;
+        }
     }
     return CallWindowProc(wpOrigEditProc, hwnd, msg, wParam, lParam);
 }
@@ -1660,6 +2152,9 @@ void CreateNewDocument(LPCTSTR pszFile)
     g_Document.szFileName[0] = 0;
     g_Document.ftLastWriteTime = {0};
     
+    // Close any active virtual file
+    g_VirtualFile.Close();
+    
     EnableWindow(g_Document.hEditor, TRUE);
     SendMessage(g_Document.hEditor, EM_SETREADONLY, FALSE, 0);
 
@@ -1687,7 +2182,7 @@ void UpdateTitle()
     
     TCHAR szTitle[MAX_PATH + 32];
     if (doc.szFileName[0])
-        StringCchPrintf(szTitle, MAX_PATH + 32, _T("%s%s - Just Notepad"), PathFindFileName(doc.szFileName), doc.bIsDirty ? _T("*") : _T(""));
+        StringCchPrintf(szTitle, MAX_PATH + 32, _T("%s%s%s - Just Notepad"), PathFindFileName(doc.szFileName), doc.isBinary ? _T(" [HEX]") : _T(""), doc.bIsDirty ? _T("*") : _T(""));
     else
         StringCchPrintf(szTitle, MAX_PATH + 32, _T("Untitled%s - Just Notepad"), doc.bIsDirty ? _T("*") : _T(""));
     SetWindowText(hMain, szTitle);
@@ -1783,6 +2278,10 @@ void UpdateStatusBar()
     long nLine = SendMessage(hEditor, EM_EXLINEFROMCHAR, 0, cr.cpMin);
     long nCol = cr.cpMin - SendMessage(hEditor, EM_LINEINDEX, nLine, 0);
     
+    // In virtual mode, offset line number by viewTopLine
+    if (g_VirtualFile.active)
+        nLine += (long)g_VirtualFile.viewTopLine;
+    
     // Get text length
     GETTEXTLENGTHEX gtl = { GTL_DEFAULT, 1200 }; // 1200 is CP_UNICODE
     long nLen = SendMessage(hEditor, EM_GETTEXTLENGTHEX, (WPARAM)&gtl, 0);
@@ -1791,7 +2290,15 @@ void UpdateStatusBar()
     const EncodingInfo* info = GetEncodingInfo(doc.currentEncoding);
     long nBytes = 0;
 
-    if (doc.bLoading)
+    if (g_VirtualFile.active)
+    {
+        nBytes = g_VirtualFile.fileSize;
+    }
+    else if (doc.isBinary)
+    {
+        nBytes = doc.fileSize;
+    }
+    else if (doc.bLoading)
     {
         nBytes = doc.fileSize;
     }
@@ -1814,7 +2321,17 @@ void UpdateStatusBar()
     g_StatusText[0] = szStatus;
     SendMessage(hStatus, SB_SETTEXT, 0 | SBT_OWNERDRAW, 0);
 
-    StringCchPrintf(szStatus, 256, _T("Chars: %d"), nLen);
+    if (doc.isBinary || g_VirtualFile.active)
+    {
+        if (g_VirtualFile.active)
+            StringCchPrintf(szStatus, 256, _T("Lines: %zu"), g_VirtualFile.totalLines);
+        else
+            StringCchPrintf(szStatus, 256, _T("Bytes: %d"), doc.fileSize);
+    }
+    else
+    {
+        StringCchPrintf(szStatus, 256, _T("Chars: %d"), nLen);
+    }
     g_StatusText[1] = szStatus;
     SendMessage(hStatus, SB_SETTEXT, 1 | SBT_OWNERDRAW, 0);
 
@@ -1829,7 +2346,7 @@ void UpdateStatusBar()
     g_StatusText[4] = _T("Windows (CRLF)");
     SendMessage(hStatus, SB_SETTEXT, 4 | SBT_OWNERDRAW, 0);
     
-    g_StatusText[5] = info->name;
+    g_StatusText[5] = doc.isBinary ? _T("HEX") : info->name;
     SendMessage(hStatus, SB_SETTEXT, 5 | SBT_OWNERDRAW, 0);
 
     // Plugin Status
@@ -2904,6 +3421,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (g_Document.hEditor)
         {
             MoveWindow(g_Document.hEditor, 0, 0, rcClient.right, rcClient.bottom - nStatusHeight, TRUE);
+            
+            // Re-render virtual window on resize
+            if (g_VirtualFile.active)
+            {
+                VirtualFileComputeVisibleLines(g_VirtualFile, g_Document.hEditor);
+                VirtualFileRenderWindow(g_VirtualFile, g_Document.hEditor);
+            }
         }
 
         // Resize Progress Bar
@@ -3353,6 +3877,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         return 0;
     case WM_DESTROY:
+        g_VirtualFile.Close();
         PostQuitMessage(0);
         break;
     default:

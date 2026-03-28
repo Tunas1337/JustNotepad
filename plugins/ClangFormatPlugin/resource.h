@@ -1,8 +1,0 @@
-#pragma once
-
-#define IDR_CLANG_FORMAT 101
-#define IDD_SETTINGS_DIALOG 102
-#define IDC_STYLE_COMBO     1001
-#define IDC_INDENT_WIDTH    1002
-#define IDC_USE_TAB_COMBO   1003
-
